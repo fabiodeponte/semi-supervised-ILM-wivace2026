@@ -1,0 +1,56 @@
+# === s: VALUE OF s AND IMPACT ON ZIPF DISTRIBUTION ===
+# 0.0 -> uniform            -> all meanings equally frequent
+# 0.5 -> very mild Zipf     -> weak frequency bias
+# 1.0 -> classic Zipf       -> linguistic-like
+# 1.5 -> strong Zipf        -> few meanings dominate
+# 2.0 -> extreme            -> almost everything is rare
+# 
+# === p: STRENGTH OF CLUSTERING (BURST) ===
+# p   ->  expected length of repetition: how many times the extracted pair meaning-signal is repeated (on average) || expected length = 1/(1-p)
+# 0.0 -> 1: no repetition
+# 0.2 -> 20% probability of collecting again the same sample -> (1/0.8=) 1.25
+# 0.5 -> 50% probability of collecting again the same sample -> (1/0.5=) 2.0
+# 0.6 -> 60% probability of collecting again the same sample -> (1/0.4=) 2.5
+# 0.7 -> 70% probability of collecting again the same sample -> (1/0.3=) 3.33
+# 0.8 -> 80% probability of collecting again the same sample -> (1/0.2=) 5.0
+# 0.9 -> 90% probability of collecting again the same sample -> (1/0.1=) 10.0
+# 1.0 -> it goes indefinitely with repetion - basically you end up with only one sample repeated all over the subset
+# 
+# SamplingLevel can be either 0 or 1:
+#       0 -> Zipfian distribution applied at the sentence level
+#       1 -> Zipfian distribution applied at the bit level
+#
+# MeaningSize HiddenSize SignalSize ASize BSize Repeats Generations Epochs LearningRate Noise EncoderLoops DecoderLoops AutoencoderLoops s p SamplingLevel ChunksSize
+#
+#
+# 16 bits different epochs
+# 5 epochs
+16 16 16 480 320 3 50 5 0.5    0   1 1 20 1 0 0 0
+# 20 epochs
+16 16 16 480 320 3 50 20 0.5    0   1 1 20 1 0 0 0
+# 80 epochs
+16 16 16 480 320 3 50 80 0.5    0   1 1 20 1 0 0 0
+#
+# 16 bits different A and B sizes
+# A=15 B=10 - 20 EPOCHS
+16 16 16 60 10 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=30 B=20 - 20 EPOCHS
+16 16 16 30 20 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=60 B=40 - 20 EPOCHS
+16 16 16 60 40 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=120 B=80 - 20 EPOCHS
+16 16 16 120 80 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=240 B=160 - 20 EPOCHS
+16 16 16 240 160 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=480 B=320 - 20 EPOCHS
+16 16 16 480 320 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=960 B=640 - 20 EPOCHS
+16 16 16 960 640 3 50 20 0.5    0   1 1 20 1 0 0 0
+# A=1920 B=1280 - 20 EPOCHS
+16 16 16 1920 1280 3 50 20 0.5    0   1 1 20 1 0 0 0
+#
+# DIFFERENT BITS
+# 24 bits - A=480 B=320 - 20 EPOCHS
+24 24 24 480 320 3 50 20 0.5    0   1 1 20 1 0 0 0
+# 32 bits - A=480 B=320 - 20 EPOCHS
+32 32 32 480 320 3 50 20 0.5    0   1 1 20 1 0 0 0

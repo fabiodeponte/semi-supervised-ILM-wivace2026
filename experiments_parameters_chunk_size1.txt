@@ -1,0 +1,34 @@
+# === s: VALUE OF s AND IMPACT ON ZIPF DISTRIBUTION ===
+# 0.0 -> uniform            -> all meanings equally frequent
+# 0.5 -> very mild Zipf     -> weak frequency bias
+# 1.0 -> classic Zipf       -> linguistic-like
+# 1.5 -> strong Zipf        -> few meanings dominate
+# 2.0 -> extreme            -> almost everything is rare
+# 
+# === p: STRENGTH OF CLUSTERING (BURST) ===
+# p   ->  expected length of repetition: how many times the extracted pair meaning-signal is repeated (on average) || expected length = 1/(1-p)
+# 0.0 -> 1: no repetition
+# 0.2 -> 20% probability of collecting again the same sample -> (1/0.8=) 1.25
+# 0.5 -> 50% probability of collecting again the same sample -> (1/0.5=) 2.0
+# 0.6 -> 60% probability of collecting again the same sample -> (1/0.4=) 2.5
+# 0.7 -> 70% probability of collecting again the same sample -> (1/0.3=) 3.33
+# 0.8 -> 80% probability of collecting again the same sample -> (1/0.2=) 5.0
+# 0.9 -> 90% probability of collecting again the same sample -> (1/0.1=) 10.0
+# 1.0 -> it goes indefinitely with repetion - basically you end up with only one sample repeated all over the subset
+# 
+# SamplingLevel can be either 0 or 1:
+#       0 -> Zipfian distribution applied at the sentence level
+#       1 -> Zipfian distribution applied at the bit level
+#
+# MeaningSize HiddenSize SignalSize ASize BSize Repeats Generations Epochs LearningRate Noise EncoderLoops DecoderLoops AutoencoderLoops s p SamplingLevel ChunksSize
+#8 8 8 75 75 30 50 50 1    0   1 1 20 1 0 0
+#16 16 16 480 160 30 50 20 0.5    0   1 1 20 0 0 0
+#16 16 16 480 160 30 50 20 0.5    0   1 1 20 1 0 0
+#16 16 16 480 160 30 50 20 0.5    0   1 1 20 1 0 1
+#16 16 16 480 80 1 50 20 0.5    0   1 1 20 0 0 0
+#16 16 16 480 320 1 50 20 0.5    0   1 1 20 0 0 0
+#16 16 16 960 160 1 50 20 0.5    0   1 1 20 0 0 0
+#16 16 16 240 160 1 50 20 0.5    0   1 1 20 0 0 0
+#
+16 16 16 480 320 30 50 20 0.5    0   1 1 20 1 0 2 1
+

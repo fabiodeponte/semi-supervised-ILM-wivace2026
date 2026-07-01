@@ -1,0 +1,1246 @@
+/*
+Version 05: performance-optimized (functionally identical to v04)
+  - FIX A: hoisted the autoencoder pool `A` out of the inner BSize loop and removed the
+           unused `T = CopyAndShuffle(supervisedPairs)` (these rebuilt the full 2^n set on
+           every inner iteration — the main 16-bit slowdown).
+  - FIX B: AnalyzeBitCompositionality no longer re-encodes the whole meaning space once per
+           signal bit for adherence; it reads the already-computed signal/meaning matrices.
+  - FIX C: each generation encodes the full meaning space ONCE (pupil + tutor, rounded) and
+           the metrics that use the >=0.5 convention read those cached matrices instead of
+           re-encoding. Stability (continuous tutor signal) and StabilityBitAccuracy (>0.5
+           rounding) keep their own passes to preserve exact semantics.
+  - The CSV formats and all metric VALUES are unchanged. The only visible difference is that
+    the verbose per-generation bit-frequency console dump inside AnalyzeBitCompositionality
+    is gone (it was debug output).
+
+  - v04 feature retained: `samplingLevel` parameter (sentence|bit).
+
+Files written (unchanged formats):
+  general_results{NN}_{suffix}.csv          : one row per generation (aggregate metrics)
+  bit_results{NN}_{suffix}.csv      : 8/16 rows per generation (per signal bit)
+  sentence_results{NN}_{suffix}.csv : ~(meaningSize+1) rows per generation (log2 frequency bins)
+*/
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.IO;
+
+
+
+/* ============================================================
+* BIT-LEVEL ZIPF SAMPLING CLASS
+* ============================================================ */
+public static class BitLevelSampler
+{
+    public static double[] ZipfWeights(int n, double s = 1.0)
+    {
+        double[] weights = new double[n];
+        for (int i = 0; i < n; i++)
+            weights[i] = 1.0 / Math.Pow(i + 1, s);
+
+        double firstWeight = weights[0];
+        for (int i = 0; i < n; i++)
+            weights[i] = 0.5 * (weights[i] / firstWeight);
+
+        return weights;
+    }
+
+    public static List<(double[] meaning, double[] signal)> SampleBitLevelZipf(
+        Agent tutor,
+        int sampleSize,
+        int meaningSize,
+        double s,
+        double burstStopProbability,
+        Random rng)
+    {
+        double[] bitProbabilities = ZipfWeights(meaningSize, s);
+        Array.Reverse(bitProbabilities);  // last bit gets highest probability
+
+        var samples = new List<(double[], double[])>(sampleSize);
+        for (int i = 0; i < sampleSize; i++)
+        {
+            double[] meaning = new double[meaningSize];
+            for (int bit = 0; bit < meaningSize; bit++)
+                meaning[bit] = rng.NextDouble() < bitProbabilities[bit] ? 1.0 : 0.0;
+
+            double[] signal = tutor.ForwardEncoder(meaning);
+            double[] roundedSignal = signal.Select(x => x >= 0.5 ? 1.0 : 0.0).ToArray();
+
+            samples.Add((meaning, roundedSignal));
+
+            if (burstStopProbability > 0)
+            {
+                while (rng.NextDouble() < burstStopProbability && samples.Count < sampleSize)
+                {
+                    samples.Add((meaning, roundedSignal));
+                    i++;
+                }
+            }
+        }
+        return samples;
+    }
+}
+
+/* ============================================================
+* SENTENCE-LEVEL ZIPF SAMPLING CLASS
+* ============================================================ */
+public static class SentenceLevelSampler
+{
+    // Prefix sums of the weights, built once per sampling call.
+    private static double[] BuildCumulative(double[] weights)
+    {
+        double[] cum = new double[weights.Length];
+        double running = 0.0;
+        for (int i = 0; i < weights.Length; i++)
+        {
+            running += weights[i];
+            cum[i] = running;
+        }
+        return cum;
+    }
+
+    // One draw: smallest index i with cum[i] > r.  O(log n) instead of O(n).
+    private static int SampleFromCumulative(double[] cum, Random rng)
+    {
+        double r = rng.NextDouble() * cum[cum.Length - 1];
+        int lo = 0, hi = cum.Length - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (cum[mid] <= r) lo = mid + 1;
+            else               hi = mid;
+        }
+        return lo;
+    }
+
+    // Zipf weights over n ranks, normalized.
+    public static double[] ZipfWeights(int n, double s = 1.0)
+    {
+        double[] weights = new double[n];
+        double sum = 0.0;
+        for (int i = 0; i < n; i++)
+        {
+            weights[i] = 1.0 / Math.Pow(i + 1, s);
+            sum += weights[i];
+        }
+        for (int i = 0; i < n; i++)
+            weights[i] /= sum;
+        return weights;
+    }
+
+    // Decode an integer rank-index into a meaning vector (bit j of index -> meaning[j]).
+    private static double[] IndexToMeaning(int index, int meaningSize)
+    {
+        double[] meaning = new double[meaningSize];
+        for (int j = 0; j < meaningSize; j++)
+            meaning[j] = ((index >> j) & 1) == 1 ? 1.0 : 0.0;
+        return meaning;
+    }
+
+    public static List<(double[] meaning, double[] signal)> SampleSentenceLevelZipf(
+        Agent tutor,
+        int sampleSize,
+        int meaningSize,
+        double s,
+        double burstStopProbability,
+        Random rng)
+    {
+        int vocabSize = 1 << meaningSize;
+        double[] weights = ZipfWeights(vocabSize, s);
+        Array.Reverse(weights);  // index 255 (11111111) gets highest probability
+        double[] cum = BuildCumulative(weights);
+
+        var samples = new List<(double[], double[])>(sampleSize);
+        for (int i = 0; i < sampleSize; i++)
+        {
+            int index = SampleFromCumulative(cum, rng);
+            double[] meaning = IndexToMeaning(index, meaningSize);
+            double[] signal = tutor.ForwardEncoder(meaning);
+            double[] roundedSignal = signal.Select(x => x >= 0.5 ? 1.0 : 0.0).ToArray();
+
+            samples.Add((meaning, roundedSignal));
+
+            if (burstStopProbability > 0)
+            {
+                while (rng.NextDouble() < burstStopProbability && samples.Count < sampleSize)
+                {
+                    samples.Add((meaning, roundedSignal));
+                    i++;
+                }
+            }
+        }
+        return samples;
+    }
+}
+
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        System.Threading.Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
+        Console.WriteLine("Usage: dotnet run <meaningSize> <hiddenSize> <signalSize> <ASize> <BSize> <repeats> <generations> <epochs> <learningRate> <noise> <enc_loop> <dec_loop> <auto_loop> <s> <p> <samplingLevel: sentence|bit>");
+
+        int meaningSize = args.Length > 0 ? int.Parse(args[0]) : 8;
+        int hiddenSize  = args.Length > 1 ? int.Parse(args[1]) : 8;
+        int signalSize  = args.Length > 2 ? int.Parse(args[2]) : 8;
+
+        int ASize = args.Length > 3 ? int.Parse(args[3]) : 120;
+        int BSize = args.Length > 4 ? int.Parse(args[4]) : 120;
+
+        int repeats = args.Length > 5 ? int.Parse(args[5]) : 3;
+        int generations = args.Length > 6 ? int.Parse(args[6]) : 50;
+        int epochs = args.Length > 7 ? int.Parse(args[7]) : 30;
+
+        double learningRate = args.Length > 8 ? double.Parse(args[8]) : 1.0;
+        float noise = args.Length > 9 ? float.Parse(args[9]) : 0.0f;
+
+        int enc_loop = args.Length > 10 ? int.Parse(args[10]) : 1;
+        int dec_loop = args.Length > 11 ? int.Parse(args[11]) : 1;
+        int auto_loop = args.Length > 12 ? int.Parse(args[12]) : 20;
+
+        double s = args.Length > 13 ? double.Parse(args[13]) : 0.0;
+        double p = args.Length > 14 ? double.Parse(args[14]) : 0.0;
+
+        double sentence_level = args.Length > 15 ? double.Parse(args[15]) : 0.0;
+
+        string samplingLevel = "";
+        if (sentence_level == 0) samplingLevel = "sentence";
+        if (sentence_level == 1) samplingLevel = "bit";
+
+        if (samplingLevel != "sentence" && samplingLevel != "bit")
+        {
+            Console.WriteLine($"Unknown sampling level '{samplingLevel}', defaulting to 'sentence'. Use 'sentence' or 'bit'.");
+            samplingLevel = "sentence";
+        }
+
+Console.WriteLine("==========================================");
+for (int i = 0; i < args.Length; i++)
+{
+    Console.WriteLine($"args[{i}] = '{args[i]}'");
+}
+Console.WriteLine("==========================================");
+
+
+
+        Console.WriteLine("Running experiment with parameters:");
+        Console.WriteLine($"Repeats: {repeats} - Generations: {generations} - Epochs: {epochs} - Learning rate: {learningRate} - Noise: {noise} - A size: {ASize} - B size: {BSize} - Meaning size: {meaningSize} - Hidden size: {hiddenSize} - Signal size: {signalSize} - Loop ratios enc/dec/autoenc: {enc_loop}/{dec_loop}/{auto_loop} - Zipf distribution s: {s} - Burst clustering p: {p} - Sampling: {samplingLevel}\n");
+
+        string paramSuffix = $"{meaningSize}_{hiddenSize}_{signalSize}_{ASize}_{BSize}_{repeats}_{generations}_{epochs}_{learningRate}_{noise}_{enc_loop}_{dec_loop}_{auto_loop}_{s}_{p}_{samplingLevel}";
+
+        ResultsFile.Initialize(paramSuffix);
+        BitResultsFile.Initialize(paramSuffix);
+
+        MeaningResultsFile.Initialize(paramSuffix);
+        using (var writer = new StreamWriter(MeaningResultsFile.Path, append: false))
+        {
+            writer.WriteLine("generation,log2bin,rankLabel,count,stability,compositionality,adherence");
+            writer.WriteLine($"Repeats: {repeats} - Generations: {generations} - Epochs: {epochs} - Leaning rate: {learningRate} - Noise: {noise} - A size: {ASize} - B size: {BSize} - Meaning size: {meaningSize} - Hidden size: {hiddenSize} - Signal size: {signalSize} - Loop ratios enc/dec/autoenc: {enc_loop}/{dec_loop}/{auto_loop} - Zipf distribution s: {s} - Burst clustering p: {p} - Sampling: {samplingLevel}");
+        }
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        using (var writer = new StreamWriter(ResultsFile.Path, append: false))
+        {
+            writer.WriteLine($"parameters,generation,stability,stabilitybit,signalbitacc,expressivity,compositionality,languageAdherence,lossEnc,lossDec,lossAuto,s,p");
+            writer.WriteLine($"Repeats: {repeats} - Generations: {generations} - Epochs: {epochs} - Leaning rate: {learningRate} - Noise: {noise} - A size: {ASize} - B size: {BSize} - Meaning size: {meaningSize} - Hidden size: {hiddenSize} - Signal size: {signalSize} - Loop ratios enc/dec/autoenc: {enc_loop}/{dec_loop}/{auto_loop} - Zipf distribution s: {s} - Burst clustering p: {p}");
+        }
+
+        using (var writer = new StreamWriter(BitResultsFile.Path, append: false))
+        {
+            writer.WriteLine($"generation,signalBit,compositionality,freqB1,freqFull,meaningBit,correlation,adherence");
+
+        }
+
+        GenerationalLearning.IteratedLearning(
+            repeats, generations, epochs, meaningSize, hiddenSize, signalSize,
+            ASize, BSize, learningRate, noise, enc_loop, dec_loop, auto_loop,
+            s, p, samplingLevel);
+    }
+}
+
+
+public static class GenerationalLearning
+{
+    private static System.Random StaticRandom = new System.Random();
+
+    public static void IteratedLearning(int whole_evolution_repeats, int generations, int epochs, int meaningSize, int hiddenSize, int signalSize, int ASize, int BSize, double learningRate, float noise, int enc_loop, int dec_loop, int auto_loop, double s, double p, string samplingLevel)
+    {
+        for (int rep = 0; rep < whole_evolution_repeats; rep++)
+        {
+            Console.WriteLine($"Repeat: {rep}/{whole_evolution_repeats}");
+            StaticRandom = new Random(rep);
+            Agent tutor = new Agent(meaningSize, hiddenSize, signalSize, 0, learningRate);
+            var allMeanings = MeaningSpaceGenerator.GenerateMeaningSpace(meaningSize);
+
+            for (int gen = 1; gen <= generations; gen++)
+            {
+                Agent pupil = new Agent(meaningSize, hiddenSize, signalSize, gen, learningRate);
+                trainAgent(tutor, pupil, ASize, BSize, allMeanings, meaningSize, epochs, learningRate, noise, gen, enc_loop, dec_loop, auto_loop, s, p, samplingLevel);
+                tutor = pupil;
+
+                //if (gen == generations)
+                if (gen <= 10)
+                {
+                    string path = $"language_evolved_after_{gen}_generations.csv";
+                    var language = MeaningSpaceGenerator.GenerateSupervisedData(tutor, allMeanings, noise = 0);
+                    Csv.SaveCsv(path, language);
+                }
+            }
+        }
+    }
+
+    public static void trainAgent(Agent tutor, Agent pupil, int ASize, int BSize, List<double[]> meanings, int meaningSize, int epochs, double learningRate, float noise, int generation, int enc_loop, int dec_loop, int auto_loop, double s, double p, string samplingLevel)
+    {
+        var supervisedPairs = MeaningSpaceGenerator.GenerateSupervisedData(tutor, meanings, noise);
+
+        double lossEnc_final = 0;
+        double lossDec_final = 0;
+        double lossAuto_final = 0;
+
+        // Training loop for the pupil
+        for (int epoch = 0; epoch < epochs; epoch++)
+        {
+            // Zipfian sampling applied to bit level or sentence level depending on parameter
+            List<(double[] meaning, double[] signal)> B1 = samplingLevel == "bit"
+                ? BitLevelSampler.SampleBitLevelZipf(tutor, BSize, meaningSize, s, p, StaticRandom)
+                : SentenceLevelSampler.SampleSentenceLevelZipf(tutor, BSize, meaningSize, s, p, StaticRandom);
+
+            //Console.WriteLine($"[Gen {generation}] B1 sample ({B1.Count} pairs):");
+            //foreach (var (meaning, signal) in B1)
+            //    Console.WriteLine($"  M=[{string.Join(",", meaning.Select(x => (int)x))}] S=[{string.Join(",", signal.Select(x => (int)x))}]");
+
+
+            var B2 = PairUtils.CopyAndShuffle(B1);
+
+            double lossEnc = 0;
+            double lossDec = 0;
+
+            // Autoencoder samples directly from the full vocabulary every step (O(1) lookup,
+            // no subset — this restores full-coverage bottleneck pressure across all epochs).
+
+            for (int i = 0; i < BSize; i++)
+            {
+                var pairB1 = B1[i];
+                var pairB2 = B2[i];
+
+                // train encoder
+                double[] enc_meaning = pairB1.meaning;
+                double[] enc_signal = pairB1.signal;
+                for (int repeat = 0; repeat < enc_loop; repeat++) lossEnc = pupil.TrainEncoder(enc_meaning, enc_signal);
+                lossEnc_final = lossEnc;
+
+                // train decoder
+                double[] dec_meaning = pairB2.meaning;
+                double[] dec_signal = pairB2.signal;
+                for (int repeat = 0; repeat < dec_loop; repeat++) lossDec = pupil.TrainDecoder(dec_signal, dec_meaning);
+                lossDec_final = lossDec;
+
+                double lossAuto = 0;
+                for (int repeat = 0; repeat < auto_loop; repeat++)
+                {
+                    var pair = supervisedPairs[StaticRandom.Next(supervisedPairs.Count)];
+                    double[] aut_meaning = pair.meaning;
+                    lossAuto = pupil.TrainAutoencoder(aut_meaning);
+                    lossAuto_final = lossAuto;
+                }
+            }
+        }
+
+        // The metrics re-encoded the full 2^meaningSize space many times each; at 16 bits that
+        // dominated runtime. Encode pupil and tutor once here (rounded at >=0.5) and reuse.
+        int V = meanings.Count;
+        int sigSize = pupil.autoencoder.signalSize;
+        int[,] meaningM  = new int[meaningSize, V];
+        int[,] pupilSigR = new int[sigSize, V];
+        int[,] tutorSigR = new int[sigSize, V];
+        for (int c = 0; c < V; c++)
+        {
+            double[] m  = meanings[c];
+            double[] ps = pupil.ForwardEncoder(m);
+            double[] ts = tutor.ForwardEncoder(m);
+            for (int r = 0; r < meaningSize; r++) meaningM[r, c]  = (int)m[r];
+            for (int r = 0; r < sigSize; r++)     pupilSigR[r, c] = ps[r] >= 0.5 ? 1 : 0;
+            for (int r = 0; r < sigSize; r++)     tutorSigR[r, c] = ts[r] >= 0.5 ? 1 : 0;
+        }
+
+        // --- METRICS ---
+        float stability_final        = Metrics.Stability(tutor, pupil, meanings);            // own pass (continuous tutor signal)
+        float stabilitybit_final     = Metrics.StabilityBitAccuracy(tutor, pupil, meanings); // own pass (> 0.5 rounding)
+        float signalbitacc_final     = Metrics.SignalBitAccuracy(tutorSigR, pupilSigR);       // cached
+        float expressivity_final     = Metrics.Expressivity(pupilSigR);                       // cached
+        float compositionality_final = Metrics.Compositionality_like_in_Eloise_but_2sided(pupilSigR, meaningM); // cached
+        Console.WriteLine($"Generation {generation} === Stability: {stability_final:F4} -- StabilityBit: {stabilitybit_final:F4} -- SignalBitAcc: {signalbitacc_final:F4} -- Expressivity: {expressivity_final:F4} -- Compositionality: {compositionality_final:F4} - LossEnc: {lossEnc_final:F4} - LossDec: {lossDec_final:F4} - LossAuto: {lossAuto_final:F4}");
+
+        // bit-level compositionality (cached signals; B1_analysis only feeds the freqB1 column)
+        var B1_analysis = BitLevelSampler.SampleBitLevelZipf(pupil, BSize, meaningSize, s, p, StaticRandom);
+        var bitStats = Metrics.AnalyzeBitCompositionality(pupilSigR, meaningM, B1_analysis);
+        float languageAdherence_final = (float)bitStats
+            .Where(b => b.meaningBit >= 0)
+            .Select(b => b.adherence)
+            .DefaultIfEmpty(0)
+            .Average();
+        Console.WriteLine($"  LanguageAdherence: {languageAdherence_final:F4}");
+
+        var binStats = Metrics.AnalyzeBinnedCompositionality(
+            pupil, pupilSigR, tutorSigR, meaningM, bitStats, meaningSize, s);
+
+        using (var writer = new StreamWriter(MeaningResultsFile.Path, append: true))
+        {
+            foreach (var bs in binStats)
+            {
+                writer.WriteLine(
+                    $"{generation}," +
+                    $"{bs.log2bin}," +
+                    $"{bs.rankLabel}," +
+                    $"{bs.count}," +
+                    $"{bs.stability:F4}," +
+                    $"{bs.compositionality:F4}," +
+                    $"{bs.adherence:F4}");
+            }
+        }
+
+        using (var writer = new StreamWriter(BitResultsFile.Path, append: true))
+        {
+            foreach (var stat in bitStats)
+            {
+                writer.WriteLine(
+                    $"{generation}," +
+                    $"{stat.signalBit}," +
+                    $"{stat.compositionality:F4}," +
+                    $"{stat.freq:F4}," +
+                    $"{stat.freq_full:F4}," +
+                    $"{stat.meaningBit}," +
+                    $"{stat.correlation:F4}," +
+                    $"{stat.adherence:F4}");
+            }
+        }
+
+        using (var writer = new StreamWriter(ResultsFile.Path, append: true))
+        {
+            writer.WriteLine(
+                $",{generation}," +
+                $"{stability_final:F4}," +
+                $"{stabilitybit_final:F4}," +
+                $"{signalbitacc_final:F4}," +
+                $"{expressivity_final:F4}," +
+                $"{compositionality_final:F4}," +
+                $"{languageAdherence_final:F4}," +
+                $"{lossEnc_final:F4}," +
+                $"{lossDec_final:F4}," +
+                $"{lossAuto_final:F4}");
+        }
+    }
+}
+
+
+public static class Metrics
+{
+    // ---- Stability: unchanged (uses CONTINUOUS tutor signal into the decoder) ----
+    public static float Stability(Agent tutor, Agent pupil, List<double[]> allMeanings)
+    {
+        int matches = 0;
+        for (int i = 0; i < allMeanings.Count; i++)
+        {
+            double[] meaning = allMeanings[i];
+            double[] tutorSignal = tutor.ForwardEncoder(meaning);
+            double[] pupilMeaning = pupil.ForwardDecoder(tutorSignal);
+            double[] roundedPupilMeaning = pupilMeaning.Select(x => x >= 0.5 ? 1.0 : 0.0).ToArray();
+            if (meaning.SequenceEqual(roundedPupilMeaning)) matches++;
+        }
+        return (float)matches / allMeanings.Count;
+    }
+
+    // ---- StabilityBitAccuracy: unchanged (uses > 0.5 rounding) ----
+    public static float StabilityBitAccuracy(Agent tutor, Agent pupil, List<double[]> allMeanings)
+    {
+        int totalBits = 0;
+        int correctBits = 0;
+        for (int i = 0; i < allMeanings.Count; i++)
+        {
+            double[] meaning = allMeanings[i];
+            double[] tutorSignal = tutor.ForwardEncoder(meaning);
+            double[] roundedTutorSignal = tutorSignal.Select(x => x > 0.5 ? 1.0 : 0.0).ToArray();
+            double[] pupilMeaning = pupil.ForwardDecoder(roundedTutorSignal);
+            double[] roundedPupilMeaning = pupilMeaning.Select(x => x > 0.5 ? 1.0 : 0.0).ToArray();
+            for (int bit = 0; bit < meaning.Length; bit++)
+            {
+                if (meaning[bit] == roundedPupilMeaning[bit]) correctBits++;
+                totalBits++;
+            }
+        }
+        return (float)correctBits / totalBits;
+    }
+
+    // ---- SignalBitAccuracy: cached-matrix version (both sides rounded at >=0.5) ----
+    public static float SignalBitAccuracy(int[,] tutorSigR, int[,] pupilSigR)
+    {
+        int sig = tutorSigR.GetLength(0), V = tutorSigR.GetLength(1);
+        int total = 0, correct = 0;
+        for (int c = 0; c < V; c++)
+            for (int r = 0; r < sig; r++)
+            {
+                if (tutorSigR[r, c] == pupilSigR[r, c]) correct++;
+                total++;
+            }
+        return (float)correct / total;
+    }
+
+    // ---- Expressivity: cached-matrix version ----
+    public static float Expressivity(int[,] pupilSigR)
+    {
+        int sig = pupilSigR.GetLength(0), V = pupilSigR.GetLength(1);
+        var seen = new HashSet<string>();
+        var sb = new System.Text.StringBuilder();
+        for (int c = 0; c < V; c++)
+        {
+            sb.Clear();
+            for (int r = 0; r < sig; r++) { sb.Append(pupilSigR[r, c]); sb.Append(','); }
+            seen.Add(sb.ToString());
+        }
+        return (float)seen.Count / V;
+    }
+
+    // ---- Compositionality (there's a difference with Eloise: here entropy is TWO-sided): cached-matrix version ----
+    public static float Compositionality_like_in_Eloise_but_2sided(int[,] signalMatrix, int[,] meaningMatrix)
+    {
+        int n = meaningMatrix.GetLength(0);
+        int numMessages = meaningMatrix.GetLength(1);
+
+        var entropy = new List<List<double>>();
+        for (int i = 0; i < n; i++) entropy.Add(new List<double>());
+
+        for (int mCol = 0; mCol < n; mCol++)
+        {
+            double[] currColEntropy = Enumerable.Repeat(1.0, n).ToArray();
+            for (int signalCol = 0; signalCol < n; signalCol++)
+            {
+                double sum1 = 0, sum0 = 0;
+                for (int msg = 0; msg < numMessages; msg++)
+                {
+                    sum1 += meaningMatrix[mCol, msg] * signalMatrix[signalCol, msg];
+                    sum0 += (1 - meaningMatrix[mCol, msg]) * signalMatrix[signalCol, msg];
+                }
+                double p1 = sum1 / Math.Pow(2, n - 1);
+                double p0 = sum0 / Math.Pow(2, n - 1);
+                currColEntropy[signalCol] = 0.5 * CalculateEntropy(p1) + 0.5 * CalculateEntropy(p0);
+            }
+            int minIndex = Array.IndexOf(currColEntropy, currColEntropy.Min());
+            entropy[minIndex].Add(currColEntropy[minIndex]);
+        }
+
+        double entropySum = 0;
+        foreach (var vals in entropy)
+            entropySum += vals.Count > 0 ? vals.Min() : 1.0;
+
+        return 1f - (float)(entropySum / n);
+    }
+
+    // ---- AnalyzeBitCompositionality: compositionality version (two-sided entropy, Eloise-comparable) ----
+    public static List<BitStatistic> AnalyzeBitCompositionality(int[,] signalMatrix, int[,] meaningMatrix, List<(double[] meaning, double[] signal)> B1)
+    {
+        int n = signalMatrix.GetLength(0);
+        int numMessages = signalMatrix.GetLength(1);
+
+        int[] signalFreq_full = new int[n];
+        for (int msg = 0; msg < numMessages; msg++)
+            for (int bit = 0; bit < n; bit++)
+                signalFreq_full[bit] += signalMatrix[bit, msg];
+
+        int[] signalFreq_B1 = new int[n];
+        foreach (var (meaning, signal) in B1)
+            for (int bit = 0; bit < n; bit++)
+                signalFreq_B1[bit] += (int)signal[bit];
+
+        // two-sided entropy table, same formula as the updated Eloise
+        double[,] allEntropies = new double[n, n];
+        double[,] allPValues   = new double[n, n];
+        for (int mCol = 0; mCol < n; mCol++)
+            for (int signalCol = 0; signalCol < n; signalCol++)
+            {
+                double sum1 = 0, sum0 = 0;
+                for (int msg = 0; msg < numMessages; msg++)
+                {
+                    sum1 += meaningMatrix[mCol, msg] * signalMatrix[signalCol, msg];
+                    sum0 += (1 - meaningMatrix[mCol, msg]) * signalMatrix[signalCol, msg];
+                }
+                double p1 = sum1 / Math.Pow(2, n - 1);
+                double p0 = sum0 / Math.Pow(2, n - 1);
+                allPValues[mCol, signalCol]   = p1;
+                allEntropies[mCol, signalCol] = 0.5 * CalculateEntropy(p1) + 0.5 * CalculateEntropy(p0);
+            }
+
+        // greedy one-to-one assignment (unchanged)
+        int[] signalToMeaning  = Enumerable.Repeat(-1, n).ToArray();
+        double[] assignedEntropy = Enumerable.Repeat(1.0, n).ToArray();
+        double[] assignedPValue  = Enumerable.Repeat(0.5, n).ToArray();
+        bool[] meaningUsed = new bool[n];
+        bool[] signalUsed  = new bool[n];
+
+        for (int assignment = 0; assignment < n; assignment++)
+        {
+            double bestEnt = double.MaxValue;
+            int bestM = -1, bestS = -1;
+            for (int m = 0; m < n; m++)
+            {
+                if (meaningUsed[m]) continue;
+                for (int sgl = 0; sgl < n; sgl++)
+                {
+                    if (signalUsed[sgl]) continue;
+                    if (allEntropies[m, sgl] < bestEnt)
+                    {
+                        bestEnt = allEntropies[m, sgl];
+                        bestM = m;
+                        bestS = sgl;
+                    }
+                }
+            }
+            signalToMeaning[bestS] = bestM;
+            assignedEntropy[bestS] = bestEnt;
+            assignedPValue[bestS]  = allPValues[bestM, bestS];
+            meaningUsed[bestM] = true;
+            signalUsed[bestS]  = true;
+        }
+
+        var bitStats = new List<BitStatistic>();
+        for (int sBit = 0; sBit < n; sBit++)
+        {
+            int mappedMeaningBit  = signalToMeaning[sBit];
+            double twoSidedEnt    = assignedEntropy[sBit];
+            double compositionality = 1.0 - twoSidedEnt;
+            double correlation    = 2.0 * assignedPValue[sBit] - 1.0;
+            double freq_B1        = signalFreq_B1[sBit]  / (double)B1.Count;
+            double freq_full      = signalFreq_full[sBit] / (double)numMessages;
+
+            double adherence = 0.0;
+            if (mappedMeaningBit >= 0)
+            {
+                int adherenceCorrect = 0;
+                for (int msg = 0; msg < numMessages; msg++)
+                {
+                    int roundedSig = signalMatrix[sBit, msg];
+                    int expected = correlation >= 0
+                        ? meaningMatrix[mappedMeaningBit, msg]
+                        : 1 - meaningMatrix[mappedMeaningBit, msg];
+                    if (roundedSig == expected) adherenceCorrect++;
+                }
+                adherence = (double)adherenceCorrect / numMessages;
+            }
+
+            bitStats.Add(new BitStatistic
+            {
+                signalBit        = sBit,
+                entropy          = twoSidedEnt,
+                compositionality = compositionality,
+                freq             = freq_B1,
+                freq_full        = freq_full,
+                meaningBit       = mappedMeaningBit,
+                correlation      = correlation,
+                adherence        = adherence
+            });
+        }
+
+        bitStats.Sort((a, b) => b.compositionality.CompareTo(a.compositionality));
+        return bitStats;
+    }
+
+
+    private static double CalculateCorrelation(double[] x, double[] y)
+    {
+        if (x.Length != y.Length || x.Length == 0) return 0;
+        double meanX = x.Average();
+        double meanY = y.Average();
+        double numerator = 0, sumXSquared = 0, sumYSquared = 0;
+        for (int i = 0; i < x.Length; i++)
+        {
+            double dx = x[i] - meanX;
+            double dy = y[i] - meanY;
+            numerator += dx * dy;
+            sumXSquared += dx * dx;
+            sumYSquared += dy * dy;
+        }
+        if (sumXSquared == 0 || sumYSquared == 0) return 0;
+        return numerator / Math.Sqrt(sumXSquared * sumYSquared);
+    }
+
+    private static double CalculateEntropy(double p)
+    {
+        if (p == 0 || p == 1) return 0;
+        return -p * Math.Log(p) / Math.Log(2) - (1 - p) * Math.Log(1 - p) / Math.Log(2);
+    }
+
+    public class BitStatistic
+    {
+        public int signalBit;
+        public double entropy;
+        public double compositionality;
+        public double freq;        // frequency in B1 (training data)
+        public double freq_full;   // frequency in full meaning space
+        public int meaningBit;
+        public double correlation = 0.0;
+        public double adherence = 0.0;
+    }
+
+    public class BinStatistic
+    {
+        public int    log2bin;
+        public int    rankLabel;   // 2^log2bin
+        public int    count;
+        public double stability;
+        public double compositionality;
+        public double adherence;
+    }
+
+    // floor(log2(x)) for x >= 1, exact (no floating point).
+    private static int FloorLog2(int x)
+    {
+        int b = 0;
+        while ((x >> 1) > 0) { x >>= 1; b++; }
+        return b;
+    }
+
+    // ---- AnalyzeBinnedCompositionality: cached-matrix version ----
+    // rank = idx + 1 (ZipfWeights strictly decreasing in idx). Comp & adherence read the
+    // cached matrices; stability needs one pupil DECODE of the rounded tutor signal.
+    public static List<BinStatistic> AnalyzeBinnedCompositionality(
+        Agent pupil, int[,] pupilSigR, int[,] tutorSigR, int[,] meaningM,
+        List<BitStatistic> bitStats, int meaningSize, double s)
+    {
+        int n = meaningSize;
+        int V = meaningM.GetLength(1);
+        int sig = pupilSigR.GetLength(0);
+        int nBins = FloorLog2(V) + 1;
+
+        var validMaps = bitStats.Where(b => b.meaningBit >= 0).ToList();
+
+        double[] sumStab = new double[nBins];
+        double[] sumComp = new double[nBins];
+        double[] sumAdh  = new double[nBins];
+        int[]    cnt     = new int[nBins];
+
+        double[] tSigBuf = new double[sig]; // reused decode-input buffer
+
+        for (int c = 0; c < V; c++)
+        {
+            // meaning index (little-endian) -> rank -> log2 bin
+            int idx = 0;
+            for (int j = 0; j < n; j++) if (meaningM[j, c] == 1) idx |= (1 << j);
+            int bin = FloorLog2(idx + 1);
+
+            // compositionality: fraction of signal bits obeying the global grammar
+            int compCorrect = 0, compTotal = 0;
+            foreach (var map in validMaps)
+            {
+                int expected = map.correlation >= 0
+                    ? meaningM[map.meaningBit, c]
+                    : 1 - meaningM[map.meaningBit, c];
+                if (pupilSigR[map.signalBit, c] == expected) compCorrect++;
+                compTotal++;
+            }
+            double comp = compTotal > 0 ? (double)compCorrect / compTotal : 0.0;
+
+            // adherence: tutor <-> pupil signal agreement
+            int adhCorrect = 0;
+            for (int r = 0; r < sig; r++) if (tutorSigR[r, c] == pupilSigR[r, c]) adhCorrect++;
+            double adh = (double)adhCorrect / sig;
+
+            // stability: round-trip bit accuracy (tutor rounded signal -> pupil decode)
+            for (int r = 0; r < sig; r++) tSigBuf[r] = tutorSigR[r, c];
+            double[] pMean = pupil.ForwardDecoder(tSigBuf);
+            int stabCorrect = 0;
+            for (int j = 0; j < n; j++)
+                if ((pMean[j] >= 0.5 ? 1 : 0) == meaningM[j, c]) stabCorrect++;
+            double stab = (double)stabCorrect / n;
+
+            sumStab[bin] += stab;
+            sumComp[bin] += comp;
+            sumAdh[bin]  += adh;
+            cnt[bin]++;
+        }
+
+        var bins = new List<BinStatistic>(nBins);
+        for (int b = 0; b < nBins; b++)
+        {
+            if (cnt[b] == 0) continue;
+            bins.Add(new BinStatistic
+            {
+                log2bin          = b,
+                rankLabel        = 1 << b,
+                count            = cnt[b],
+                stability        = sumStab[b] / cnt[b],
+                compositionality = sumComp[b] / cnt[b],
+                adherence        = sumAdh[b]  / cnt[b]
+            });
+        }
+        return bins;
+    }
+}
+
+
+public static class PairUtils
+{
+    public static List<(double[] meaning, double[] signal)> RandomSubset(
+        List<(double[] meaning, double[] signal)> supervisedPairs,
+        int subsetSize)
+    {
+        if (subsetSize <= 0 || subsetSize > supervisedPairs.Count)
+            throw new ArgumentException("subsetSize must be between 1 and supervisedPairs.Count");
+
+        System.Random rand = new System.Random();
+        return supervisedPairs
+            .OrderBy(x => rand.Next())
+            .Take(subsetSize)
+            .ToList();
+    }
+
+    public static List<(double[] meaning, double[] signal)> CopyAndShuffle(
+        List<(double[] meaning, double[] signal)> subset)
+    {
+        var copy = new List<(double[] meaning, double[] signal)>(subset.Count);
+        foreach (var (meaning, signal) in subset)
+        {
+            double[] newMeaning = new double[meaning.Length];
+            double[] newSignal = new double[signal.Length];
+            Array.Copy(meaning, newMeaning, meaning.Length);
+            Array.Copy(signal, newSignal, signal.Length);
+            copy.Add((newMeaning, newSignal));
+        }
+
+        System.Random rand = new System.Random();
+        for (int i = copy.Count - 1; i > 0; i--)
+        {
+            int j = rand.Next(i + 1);
+            (copy[i], copy[j]) = (copy[j], copy[i]);
+        }
+        return copy;
+    }
+}
+
+public class Agent
+{
+    public MLP autoencoder;
+    public int id;
+
+    public Agent(int meaningSize = 8, int hiddenSize = 8, int signalSize = 8, int identifier = 0, double learningRate = 0.1)
+    {
+        autoencoder = new MLP(meaningSize, hiddenSize, signalSize, learningRate);
+        id = identifier;
+    }
+
+    public double[] ForwardEncoder(double[] meaning) => autoencoder.ForwardEncoder(meaning);
+    public double[] ForwardDecoder(double[] signal) => autoencoder.ForwardDecoder(signal);
+    public double TrainEncoder(double[] input, double[] target) => autoencoder.TrainEncoder(input, target);
+    public double TrainDecoder(double[] input, double[] target) => autoencoder.TrainDecoder(input, target);
+    public double TrainAutoencoder(double[] input) => autoencoder.TrainAutoencoder(input);
+}
+
+public static class MeaningSpaceGenerator
+{
+    public static List<double[]> GenerateMeaningSpace(int bitN)
+    {
+        List<double[]> space = new List<double[]>();
+        int total = (int)Math.Pow(2, bitN);
+        for (int i = 0; i < total; i++)
+            space.Add(IntToBin(bitN, i));
+        return space;
+    }
+
+    private static double[] IntToBin(int bitN, int value)
+    {
+        double[] bits = new double[bitN];
+        for (int j = 0; j < bitN; j++)
+            bits[bitN - j - 1] = (value >> j) & 1;
+        return bits;
+    }
+
+    public static List<(double[] meaning, double[] signal)> GenerateSupervisedData(Agent agent, List<double[]> meaningSpace, float noise)
+    {
+        var supervisedPairs = new List<(double[] meaning, double[] signal)>();
+        System.Random rand = new System.Random();
+
+        foreach (var meaning in meaningSpace)
+        {
+            double[] signal = agent.ForwardEncoder(meaning);
+            for (int i = 0; i < signal.Length; i++)
+                signal[i] += (rand.NextDouble() * 2 - 1) * (noise / 2);
+            double[] roundedSignal = Binary(signal);
+            supervisedPairs.Add((meaning, roundedSignal));
+        }
+        return supervisedPairs;
+    }
+
+    public static double[] Binary(double[] input)
+    {
+        double[] binary = new double[input.Length];
+        for (int i = 0; i < input.Length; i++)
+            binary[i] = input[i] >= 0.5 ? 1.0 : 0.0;
+        return binary;
+    }
+}
+
+public class MLP
+{
+    public int meaningSize, hiddenSize, signalSize;
+
+    public double[,] We1;
+    public double[,] We2;
+    public double[] Be1;
+    public double[] Be2;
+
+    public double[,] Wd1;
+    public double[,] Wd2;
+    public double[] Bd1;
+    public double[] Bd2;
+
+    public double lr = 0.1;
+
+    public MLP(int input, int hidden, int output, double learningRate)
+    {
+        meaningSize = input;
+        hiddenSize = hidden;
+        signalSize = output;
+        lr = learningRate;
+
+        We1 = new double[meaningSize, hiddenSize];
+        We2 = new double[hiddenSize, signalSize];
+        Wd1 = new double[signalSize, hiddenSize];
+        Wd2 = new double[hiddenSize, meaningSize];
+
+        Be1 = new double[hiddenSize];
+        Be2 = new double[signalSize];
+        Bd1 = new double[hiddenSize];
+        Bd2 = new double[meaningSize];
+
+        double limit1 = Math.Sqrt(6.0 / (meaningSize + hiddenSize));
+        double limit2 = Math.Sqrt(6.0 / (hiddenSize + signalSize));
+
+        System.Random rnd = new System.Random();
+
+        for (int i = 0; i < meaningSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                We1[i, j] = rnd.NextDouble() * 2 * limit1 - limit1;
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < signalSize; j++)
+                We2[i, j] = rnd.NextDouble() * 2 * limit2 - limit2;
+
+        for (int i = 0; i < signalSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                Wd1[i, j] = rnd.NextDouble() * 2 * limit1 - limit1;
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < meaningSize; j++)
+                Wd2[i, j] = rnd.NextDouble() * 2 * limit2 - limit2;
+
+        for (int i = 0; i < hiddenSize; i++) { Be1[i] = 0.0; Bd1[i] = 0.0; }
+        for (int i = 0; i < signalSize; i++) Be2[i] = 0.0;
+        for (int i = 0; i < meaningSize; i++) Bd2[i] = 0.0;
+    }
+
+    double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
+    double SigmoidDerivative(double y) => y * (1.0 - y);
+
+    double MSE(double[] target, double[] output)
+    {
+        double loss = 0.0;
+        for (int i = 0; i < output.Length; i++)
+            loss += Math.Pow(target[i] - output[i], 2);
+        return loss / output.Length;
+    }
+
+    public double[] ForwardEncoder(double[] input)
+    {
+        double[] hidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Be1[i];
+            for (int j = 0; j < meaningSize; j++) sum += input[j] * We1[j, i];
+            hidden[i] = Sigmoid(sum);
+        }
+        double[] output = new double[signalSize];
+        for (int i = 0; i < signalSize; i++)
+        {
+            double sum = Be2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += hidden[j] * We2[j, i];
+            output[i] = Sigmoid(sum);
+        }
+        return output;
+    }
+
+    public double[] ForwardDecoder(double[] input)
+    {
+        double[] hidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Bd1[i];
+            for (int j = 0; j < signalSize; j++) sum += input[j] * Wd1[j, i];
+            hidden[i] = Sigmoid(sum);
+        }
+        double[] output = new double[meaningSize];
+        for (int i = 0; i < meaningSize; i++)
+        {
+            double sum = Bd2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += hidden[j] * Wd2[j, i];
+            output[i] = Sigmoid(sum);
+        }
+        return output;
+    }
+
+    public double TrainEncoder(double[] input, double[] target)
+    {
+        double[] hidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Be1[i];
+            for (int j = 0; j < meaningSize; j++) sum += input[j] * We1[j, i];
+            hidden[i] = Sigmoid(sum);
+        }
+        double[] output = new double[signalSize];
+        for (int i = 0; i < signalSize; i++)
+        {
+            double sum = Be2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += hidden[j] * We2[j, i];
+            output[i] = Sigmoid(sum);
+        }
+        double loss = MSE(target, output);
+
+        double[] deltaOut = new double[signalSize];
+        for (int i = 0; i < signalSize; i++)
+            deltaOut[i] = (output[i] - target[i]) * SigmoidDerivative(output[i]);
+
+        double[] deltaHidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < signalSize; j++) sum += deltaOut[j] * We2[i, j];
+            deltaHidden[i] = sum * SigmoidDerivative(hidden[i]);
+        }
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < signalSize; j++)
+                We2[i, j] -= lr * deltaOut[j] * hidden[i];
+        for (int j = 0; j < signalSize; j++) Be2[j] -= lr * deltaOut[j];
+
+        for (int i = 0; i < meaningSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                We1[i, j] -= lr * deltaHidden[j] * input[i];
+        for (int j = 0; j < hiddenSize; j++) Be1[j] -= lr * deltaHidden[j];
+
+        return loss;
+    }
+
+    public double TrainDecoder(double[] input, double[] target)
+    {
+        double[] hidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Bd1[i];
+            for (int j = 0; j < signalSize; j++) sum += input[j] * Wd1[j, i];
+            hidden[i] = Sigmoid(sum);
+        }
+        double[] output = new double[meaningSize];
+        for (int i = 0; i < meaningSize; i++)
+        {
+            double sum = Bd2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += hidden[j] * Wd2[j, i];
+            output[i] = Sigmoid(sum);
+        }
+        double loss = MSE(target, output);
+
+        double[] deltaOut = new double[meaningSize];
+        for (int i = 0; i < meaningSize; i++)
+            deltaOut[i] = (output[i] - target[i]) * SigmoidDerivative(output[i]);
+
+        double[] deltaHidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < meaningSize; j++) sum += deltaOut[j] * Wd2[i, j];
+            deltaHidden[i] = sum * SigmoidDerivative(hidden[i]);
+        }
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < meaningSize; j++)
+                Wd2[i, j] -= lr * deltaOut[j] * hidden[i];
+        for (int j = 0; j < meaningSize; j++) Bd2[j] -= lr * deltaOut[j];
+
+        for (int i = 0; i < signalSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                Wd1[i, j] -= lr * deltaHidden[j] * input[i];
+        for (int j = 0; j < hiddenSize; j++) Bd1[j] -= lr * deltaHidden[j];
+
+        return loss;
+    }
+
+    public double TrainAutoencoder(double[] input)
+    {
+        double[] ehidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Be1[i];
+            for (int j = 0; j < meaningSize; j++) sum += input[j] * We1[j, i];
+            ehidden[i] = Sigmoid(sum);
+        }
+        double[] eoutput = new double[signalSize];
+        for (int i = 0; i < signalSize; i++)
+        {
+            double sum = Be2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += ehidden[j] * We2[j, i];
+            eoutput[i] = Sigmoid(sum);
+        }
+
+        double[] dhidden = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = Bd1[i];
+            for (int j = 0; j < signalSize; j++) sum += eoutput[j] * Wd1[j, i];
+            dhidden[i] = Sigmoid(sum);
+        }
+        double[] doutput = new double[meaningSize];
+        for (int i = 0; i < meaningSize; i++)
+        {
+            double sum = Bd2[i];
+            for (int j = 0; j < hiddenSize; j++) sum += dhidden[j] * Wd2[j, i];
+            doutput[i] = Sigmoid(sum);
+        }
+
+        double[] target = input;
+        double loss = MSE(target, doutput);
+
+        double[] deltaOut = new double[meaningSize];
+        for (int i = 0; i < meaningSize; i++)
+            deltaOut[i] = (doutput[i] - target[i]) * SigmoidDerivative(doutput[i]);
+
+        double[] deltaHiddenD = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < meaningSize; j++) sum += deltaOut[j] * Wd2[i, j];
+            deltaHiddenD[i] = sum * SigmoidDerivative(dhidden[i]);
+        }
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < meaningSize; j++)
+                Wd2[i, j] -= lr * deltaOut[j] * dhidden[i];
+        for (int j = 0; j < meaningSize; j++) Bd2[j] -= lr * deltaOut[j];
+
+        for (int i = 0; i < signalSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                Wd1[i, j] -= lr * deltaHiddenD[j] * eoutput[i];
+        for (int j = 0; j < hiddenSize; j++) Bd1[j] -= lr * deltaHiddenD[j];
+
+        double[] deltaEoutput = new double[signalSize];
+        for (int i = 0; i < signalSize; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < hiddenSize; j++) sum += deltaHiddenD[j] * Wd1[i, j];
+            deltaEoutput[i] = sum * SigmoidDerivative(eoutput[i]);
+        }
+
+        double[] deltaHiddenE = new double[hiddenSize];
+        for (int i = 0; i < hiddenSize; i++)
+        {
+            double sum = 0;
+            for (int j = 0; j < signalSize; j++) sum += deltaEoutput[j] * We2[i, j];
+            deltaHiddenE[i] = sum * SigmoidDerivative(ehidden[i]);
+        }
+
+        for (int i = 0; i < hiddenSize; i++)
+            for (int j = 0; j < signalSize; j++)
+                We2[i, j] -= lr * deltaEoutput[j] * ehidden[i];
+        for (int i = 0; i < meaningSize; i++)
+            for (int j = 0; j < hiddenSize; j++)
+                We1[i, j] -= lr * deltaHiddenE[j] * input[i];
+
+        for (int i = 0; i < signalSize; i++) Be2[i] -= lr * deltaEoutput[i];
+        for (int i = 0; i < hiddenSize; i++) Be1[i] -= lr * deltaHiddenE[i];
+
+        return loss;
+    }
+}
+
+public static class Csv
+{
+    public static void SaveCsv(string path, List<(double[] meaning, double[] signal)> list)
+    {
+        using var writer = new StreamWriter(path);
+        foreach (var (meaning, signal) in list)
+        {
+            var row = string.Join(",", meaning.Concat(signal));
+            writer.WriteLine(row);
+        }
+    }
+
+    public static List<(double[] meaning, double[] signal)> LoadCsv(string path, int meaningLen, int signalLen)
+    {
+        var result = new List<(double[] meaning, double[] signal)>();
+        foreach (var line in File.ReadLines(path))
+        {
+            var parts = line.Split(',').Select(double.Parse).ToArray();
+            var meaning = parts[..meaningLen];
+            var signal = parts[meaningLen..(meaningLen + signalLen)];
+            result.Add((meaning, signal));
+        }
+        return result;
+    }
+}
+
+public static class ResultsFile
+{
+    public static string Path { get; private set; } = "";
+    public static void Initialize(string paramSuffix)
+    {
+        Path = GenerateUniquePath(paramSuffix);
+        File.WriteAllText(Path, "");
+    }
+    private static string GenerateUniquePath(string paramSuffix)
+    {
+        string folderPath = "RESULTS/";
+        string extension = ".csv";
+        int counter = 1;
+        while (Directory.GetFiles(folderPath, $"general_results{counter:00}_*{extension}").Length > 0)
+            counter++;
+        return $"{folderPath}general_results{counter:00}_{paramSuffix}{extension}";
+    }
+}
+
+public static class BitResultsFile
+{
+    public static string Path { get; private set; } = "";
+    public static void Initialize(string paramSuffix)
+    {
+        Path = GenerateUniquePath(paramSuffix);
+        File.WriteAllText(Path, "");
+    }
+    private static string GenerateUniquePath(string paramSuffix)
+    {
+        string folderPath = "RESULTS/";
+        string extension = ".csv";
+        int counter = 1;
+        while (Directory.GetFiles(folderPath, $"bit_results{counter:00}_*{extension}").Length > 0)
+            counter++;
+        return $"{folderPath}bit_results{counter:00}_{paramSuffix}{extension}";
+    }
+}
+
+public static class MeaningResultsFile
+{
+    public static string Path { get; private set; } = "";
+    public static void Initialize(string paramSuffix)
+    {
+        Path = GenerateUniquePath(paramSuffix);
+        File.WriteAllText(Path, "");
+    }
+    private static string GenerateUniquePath(string paramSuffix)
+    {
+        string folderPath = "RESULTS/";
+        string extension  = ".csv";
+        int counter = 1;
+        while (Directory.GetFiles(folderPath, $"sentence_results{counter:00}_*{extension}").Length > 0)
+            counter++;
+        return $"{folderPath}sentence_results{counter:00}_{paramSuffix}{extension}";
+    }
+}
