@@ -57,3 +57,18 @@
 /Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/standalone/semi03_sentencelevel/obj/Release/net10.0/semi.pdb
 /Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/standalone/semi03_sentencelevel/obj/Release/net10.0/semi.genruntimeconfig.cache
 /Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/standalone/semi03_sentencelevel/obj/Release/net10.0/ref/semi.dll
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /bin/Release/net10.0/semi
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /bin/Release/net10.0/semi.deps.json
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /bin/Release/net10.0/semi.runtimeconfig.json
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /bin/Release/net10.0/semi.dll
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /bin/Release/net10.0/semi.pdb
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.GeneratedMSBuildEditorConfig.editorconfig
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.AssemblyInfoInputs.cache
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.AssemblyInfo.cs
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.csproj.CoreCompileInputs.cache
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.sourcelink.json
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.dll
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/refint/semi.dll
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.pdb
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/semi.genruntimeconfig.cache
+/Users/digit/Desktop/University/SSILM/Semi_Supervised_ILM - code/semi-supervised-ILM-wivace2026 /obj/Release/net10.0/ref/semi.dll

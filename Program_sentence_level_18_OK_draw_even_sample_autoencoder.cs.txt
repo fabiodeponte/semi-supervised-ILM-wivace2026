@@ -658,26 +658,7 @@ public static class GenerationalLearning
 
     public static void trainAgent(Agent tutor, Agent pupil, int ASize, int BSize, List<double[]> meanings, int meaningSize, int epochs, double learningRate, float noise, int generation, int enc_loop, int dec_loop, int auto_loop, double s, double p, string samplingLevel, int chunkSize)
     {
-        // Autoencoder training pool.
-        // OLD behaviour: GenerateSupervisedData drew ASize meanings UNIFORMLY from the
-        // full vocabulary, so the dominant auto_loop channel was frequency-blind.
-        // NEW behaviour: draw the pool with the SAME Zipf skew (and sampling mode /
-        // fixed per-repeat permutation) as the encoder/decoder batch B1, so frequent
-        // meanings are over-represented in the autoencoder channel too. Only the
-        // meaning DISTRIBUTION changes; the pool is still built once per generation
-        // and drawn from uniformly inside the epoch loop.
-        //
-        // A dedicated RNG (autoRng) is used for these draws so the main StaticRandom
-        // stream feeding B1/enc/dec stays bit-identical to the old runs -- the only
-        // behavioural change is which meanings the autoencoder sees. Seed autoRng with
-        // a fixed value if you need the pool itself to be reproducible across runs.
-        // (Note: `noise` was only ever applied to the signals in GenerateSupervisedData,
-        //  which the autoencoder discards, so dropping that call changes no training.)
-        var autoRng = new System.Random();
-        var supervisedPairs =
-              samplingLevel.StartsWith("bit") ? BitLevelSampler.SampleBitLevelZipf(tutor, ASize, meaningSize, s, p, autoRng)
-            : samplingLevel == "chunk"        ? ChunkLevelSampler.SampleChunkLevelZipf(tutor, ASize, meaningSize, chunkSize, s, p, autoRng)
-            :                                   SentenceLevelSampler.SampleSentenceLevelZipf(tutor, ASize, meaningSize, s, p, autoRng);
+        var supervisedPairs = MeaningSpaceGenerator.GenerateSupervisedData(tutor, meanings, ASize, noise);
 
         double lossEnc_final = 0;
         double lossDec_final = 0;
@@ -702,9 +683,8 @@ public static class GenerationalLearning
             double lossEnc = 0;
             double lossDec = 0;
 
-            // Autoencoder draws (uniformly) from the Zipf-skewed pool built above, so the
-            // dominant auto_loop channel now sees the SAME frequency skew as the
-            // encoder/decoder rather than a uniform full-vocabulary draw.
+            // Autoencoder samples directly from the full vocabulary every step (O(1) lookup,
+            // no subset — this restores full-coverage bottleneck pressure across all epochs).
 
             for (int i = 0; i < BSize; i++)
             {

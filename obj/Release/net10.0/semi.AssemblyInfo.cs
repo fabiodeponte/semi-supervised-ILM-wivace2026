@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("semi")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e78b1cb78c7982da0f14f781cfb627e00133b694")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+cffb4274c4d3c7e332d1e2c142b55c590ab50ab1")]
 [assembly: System.Reflection.AssemblyProductAttribute("semi")]
 [assembly: System.Reflection.AssemblyTitleAttribute("semi")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

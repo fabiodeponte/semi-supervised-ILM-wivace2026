@@ -1,6 +1,6 @@
 #!/bin/bash
 #!/bin/bash
-PARAM_FILE="experiment_sentence_32bits.txt"
+PARAM_FILE="experiments_parameters_extreme_alpha_values.txt"
 
 # Ensure the file exists
 if [[ ! -f "$PARAM_FILE" ]]; then
